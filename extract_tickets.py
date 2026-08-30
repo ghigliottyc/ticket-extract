@@ -1,352 +1,706 @@
 #!/usr/bin/env python3
 """
-Baseball Ticket Extractor
-Extracts structured data from ticket images using Claude's vision API
-and saves results to an Excel spreadsheet.
+Baseball Ticket Extractor V2
+
+Extracts structured data from baseball ticket images using Claude's vision API,
+validates the response, performs deterministic cross-field checks, and writes
+an Excel workbook designed for archival/review workflows.
 
 Requirements:
-    pip install anthropic openpyxl pillow
+    pip install anthropic openpyxl pillow pydantic pillow-heif
 
 Usage:
-    python extract_tickets.py --tickets /path/to/ticket/images --output tickets.xlsx
-    python extract_tickets.py --tickets ./tickets --output my_games.xlsx --model haiku
+    python extract_tickets_v2.py --tickets ./tickets --output tickets.xlsx
+    python extract_tickets_v2.py --tickets ./tickets --output tickets.xlsx --model sonnet
+    python extract_tickets_v2.py --tickets ./tickets --output tickets.xlsx --workers 6
 """
 
-import anthropic
-import base64
-import json
+from __future__ import annotations
+
 import argparse
+import base64
+import io
+import json
+import logging
+import os
+import re
 import sys
-from pathlib import Path
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Literal
+
+import anthropic
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.formatting.rule import FormulaRule
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from PIL import Image, ImageOps, ImageEnhance
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-# ── Configuration ────────────────────────────────────────────────────────────
 
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".webp", ".bmp"}
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
 
-MODELS = {
-    "haiku":  "claude-haiku-4-5-20251001",   # Fastest & cheapest (~$0.01–0.02 per 200 images)
-    "sonnet": "claude-sonnet-4-6",            # More accurate, still affordable
+SUPPORTED_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".heic", ".webp", ".bmp", ".tif", ".tiff"
 }
 
-FIELDS = [
-    "date",           # e.g. "July 13, 2008"
-    "day_of_week",    # e.g. "Sunday"
-    "game_time",      # e.g. "8:05 PM"
-    "home_team",      # e.g. "New York Mets"
-    "away_team",      # e.g. "Colorado Rockies"
-    "stadium",        # e.g. "Shea Stadium"
-    "game_number",    # e.g. "47"
-    "section",        # e.g. "27"
-    "row",            # e.g. "R"
-    "seat",           # e.g. "8"
-    "seat_type",      # e.g. "Upper", "Loge Reserved", "Field Box"
-    "gate",           # e.g. "D"
-    "price",          # e.g. "$37.00"
-    "season_ticket",  # "Yes" / "No"
-    "notes",          # Any unusual info or flags for manual review
-    "confidence",     # "high" / "medium" / "low"
-]
+MODELS = {
+    "haiku": "claude-haiku-4-5-20251001",
+    "sonnet": "claude-sonnet-4-6",
+}
 
-EXTRACTION_PROMPT = """You are extracting data from a baseball ticket image. 
-Return ONLY a valid JSON object with these exact keys. Use null for any field you cannot read.
+DEFAULT_MAX_IMAGE_DIMENSION = 2400
+DEFAULT_JPEG_QUALITY = 90
+DEFAULT_WORKERS = 4
+DEFAULT_RETRIES = 3
+DEFAULT_TIMEOUT = 120.0
 
-Keys to extract:
-- date: Full date as written on ticket (e.g. "July 13, 2008")
-- day_of_week: Day of week (e.g. "Sunday")  
-- game_time: Game start time (e.g. "8:05 PM")
-- home_team: Full home team name (e.g. "New York Mets")
-- away_team: Full visiting/away team name (e.g. "Colorado Rockies")
-- stadium: Stadium or venue name
-- game_number: Game number shown on ticket (just the number, e.g. "47")
-- section: Section number or code
-- row: Row letter or number
-- seat: Seat number
-- seat_type: Seating area type (e.g. "Upper Deck", "Loge Reserved", "Field Box", "Diamond Club")
-- gate: Entry gate (e.g. "D")
-- price: Ticket face value including $ symbol (e.g. "$37.00"). Use null if not shown.
-- season_ticket: "Yes" if this is a season ticket, "No" otherwise
-- notes: Any flags for manual review (e.g. "rain check stub only", "date partially obscured")
-- confidence: Your overall confidence in the extraction — "high", "medium", or "low"
+ALLOWED_CONFIDENCE = {"high", "medium", "low"}
+ALLOWED_SEASON_TICKET = {"Yes", "No"}
 
-Return ONLY the JSON object. No explanation, no markdown, no backticks."""
+EXTRACTION_PROMPT = """
+You are extracting information from ONE baseball ticket image.
 
-# ── Core Extraction ──────────────────────────────────────────────────────────
+Your job is transcription/extraction, not reconstruction or inference.
 
-def encode_image(path: Path) -> tuple[str, str]:
-    """Return (base64_data, media_type) for an image file."""
-    suffix = path.suffix.lower()
-    media_types = {
-        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-        ".png": "image/png",  ".webp": "image/webp",
-        ".gif": "image/gif",  ".bmp": "image/png",   # bmp → send as png after convert
-        ".heic": "image/jpeg",                        # HEIC treated as jpeg
-    }
-    media_type = media_types.get(suffix, "image/jpeg")
+CRITICAL RULES:
+1. Extract only information supported by text or clearly visible printed content.
+2. NEVER guess an obscured, ambiguous, or unreadable value.
+3. NEVER infer a value from baseball knowledge, team schedules, stadium history,
+   likely opponents, or what you think the ticket "should" say.
+4. If a field cannot be read confidently from the image, use null.
+5. Preserve the ticket's wording where practical. Do not silently "correct"
+   unusual spellings or historical venue/team names.
+6. For raw_text, provide a concise transcription of the legible ticket text,
+   preserving line breaks approximately. Do not invent missing text.
+7. For evidence fields, quote only short, visibly legible text from the ticket.
+8. A field's confidence describes your confidence that the visible text supports
+   THAT FIELD, not your confidence based on outside knowledge.
+9. The overall confidence should be the lowest confidence among important
+   extracted fields.
+10. If date is visible but day-of-week is not printed, set day_of_week_printed
+    to null. Python will calculate a day-of-week independently from the date.
+11. Do not calculate, derive, or repair the game number, seat, row, section,
+    gate, price, or teams from context.
+12. Return ONLY valid JSON matching the requested schema.
 
-    # Convert HEIC / BMP if Pillow is available
-    if suffix in {".heic", ".bmp"}:
-        try:
-            from PIL import Image
-            import io
-            from pillow_heif import register_heif_opener
-            register_heif_opener()
-            img = Image.open(path).convert("RGB")
+Return this exact top-level structure:
+
+{
+  "raw_text": "string or null",
+  "date": {"value": "string or null", "confidence": "high|medium|low", "evidence": "string or null"},
+  "day_of_week_printed": {"value": "string or null", "confidence": "high|medium|low", "evidence": "string or null"},
+  "game_time": {"value": "string or null", "confidence": "high|medium|low", "evidence": "string or null"},
+  "home_team": {"value": "string or null", "confidence": "high|medium|low", "evidence": "string or null"},
+  "away_team": {"value": "string or null", "confidence": "high|medium|low", "evidence": "string or null"},
+  "stadium": {"value": "string or null", "confidence": "high|medium|low", "evidence": "string or null"},
+  "game_number": {"value": "string or null", "confidence": "high|medium|low", "evidence": "string or null"},
+  "section": {"value": "string or null", "confidence": "high|medium|low", "evidence": "string or null"},
+  "row": {"value": "string or null", "confidence": "high|medium|low", "evidence": "string or null"},
+  "seat": {"value": "string or null", "confidence": "high|medium|low", "evidence": "string or null"},
+  "seat_type": {"value": "string or null", "confidence": "high|medium|low", "evidence": "string or null"},
+  "gate": {"value": "string or null", "confidence": "high|medium|low", "evidence": "string or null"},
+  "price": {"value": "string or null", "confidence": "high|medium|low", "evidence": "string or null"},
+  "season_ticket": {"value": "Yes|No|null", "confidence": "high|medium|low", "evidence": "string or null"},
+  "notes": "string or null",
+  "confidence": "high|medium|low"
+}
+""".strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("ticket-extractor")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pydantic schema
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FieldExtraction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    value: str | None = None
+    confidence: Literal["high", "medium", "low"]
+    evidence: str | None = None
+
+
+class TicketExtraction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    raw_text: str | None = None
+    date: FieldExtraction
+    day_of_week_printed: FieldExtraction
+    game_time: FieldExtraction
+    home_team: FieldExtraction
+    away_team: FieldExtraction
+    stadium: FieldExtraction
+    game_number: FieldExtraction
+    section: FieldExtraction
+    row: FieldExtraction
+    seat: FieldExtraction
+    seat_type: FieldExtraction
+    gate: FieldExtraction
+    price: FieldExtraction
+    season_ticket: FieldExtraction
+    notes: str | None = None
+    confidence: Literal["high", "medium", "low"]
+
+    @field_validator("season_ticket")
+    @classmethod
+    def validate_season_ticket(cls, value: FieldExtraction) -> FieldExtraction:
+        if value.value is not None and value.value not in ALLOWED_SEASON_TICKET:
+            raise ValueError("season_ticket.value must be Yes, No, or null")
+        return value
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Image handling
+# ─────────────────────────────────────────────────────────────────────────────
+
+def normalize_image(path: Path, max_dimension: int = DEFAULT_MAX_IMAGE_DIMENSION) -> tuple[str, str]:
+    """
+    Normalize orientation and size, then return base64 JPEG data.
+
+    JPEG is used for all supported formats so the API receives a consistent
+    media type. Original files are never modified.
+    """
+    try:
+        if path.suffix.lower() == ".heic":
+            try:
+                from pillow_heif import register_heif_opener
+                register_heif_opener()
+            except ImportError as exc:
+                raise RuntimeError(
+                    "HEIC image encountered but pillow-heif is not installed. "
+                    "Install with: pip install pillow-heif"
+                ) from exc
+
+        with Image.open(path) as image:
+            image = ImageOps.exif_transpose(image)
+            image = image.convert("RGB")
+
+            width, height = image.size
+            largest = max(width, height)
+            if largest > max_dimension:
+                scale = max_dimension / largest
+                image = image.resize(
+                    (max(1, round(width * scale)), max(1, round(height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+
+            # Mild enhancement; deliberately conservative to avoid altering text.
+            image = ImageEnhance.Contrast(image).enhance(1.05)
+            image = ImageEnhance.Sharpness(image).enhance(1.10)
+
             buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=90)
-            return base64.standard_b64encode(buf.getvalue()).decode("utf-8"), "image/jpeg"
-        except ImportError:
-            pass  # Fall through to raw read
+            image.save(buf, format="JPEG", quality=DEFAULT_JPEG_QUALITY, optimize=True)
+            return base64.standard_b64encode(buf.getvalue()).decode("ascii"), "image/jpeg"
 
-    with open(path, "rb") as f:
-        return base64.standard_b64encode(f.read()).decode("utf-8"), media_type
+    except Exception as exc:
+        raise RuntimeError(f"Could not normalize image '{path}': {exc}") from exc
 
 
-def extract_ticket(client: anthropic.Anthropic, image_path: Path, model: str) -> dict:
-    """Send one ticket image to Claude and return parsed JSON fields."""
-    img_data, media_type = encode_image(image_path)
+# ─────────────────────────────────────────────────────────────────────────────
+# API / extraction
+# ─────────────────────────────────────────────────────────────────────────────
 
-    response = client.messages.create(
-        model=model,
-        max_tokens=1000,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": img_data,
-                    },
-                },
-                {"type": "text", "text": EXTRACTION_PROMPT},
-            ],
-        }],
+def _strip_json_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def _is_retryable(exc: Exception) -> bool:
+    retryable_types = (
+        anthropic.RateLimitError,
+        anthropic.APITimeoutError,
+        anthropic.APIConnectionError,
+        anthropic.InternalServerError,
     )
-
-    raw = response.content[0].text.strip()
-
-    # Strip markdown fences if model adds them
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    raw = raw.strip()
-
-    result = json.loads(raw)
-
-    # Ensure all expected fields are present
-    for field in FIELDS:
-        result.setdefault(field, None)
-
-    return result
+    return isinstance(exc, retryable_types)
 
 
-# ── Excel Output ─────────────────────────────────────────────────────────────
+def extract_ticket(
+    client: anthropic.Anthropic,
+    image_path: Path,
+    model: str,
+    retries: int = DEFAULT_RETRIES,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> TicketExtraction:
+    """Extract and validate one ticket, retrying transient API failures."""
+    image_data, media_type = normalize_image(image_path)
+
+    last_error: Exception | None = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=2500,
+                timeout=timeout,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": image_data,
+                            },
+                        },
+                        {"type": "text", "text": EXTRACTION_PROMPT},
+                    ],
+                }],
+            )
+
+            raw = "".join(
+                block.text for block in response.content
+                if getattr(block, "type", None) == "text"
+            ).strip()
+
+            if not raw:
+                raise ValueError("Claude returned no text content")
+
+            payload = json.loads(_strip_json_fences(raw))
+            return TicketExtraction.model_validate(payload)
+
+        except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+            # These are deterministic output problems; retrying can sometimes
+            # help, but they are classified separately from transport failures.
+            last_error = exc
+            if attempt < retries:
+                time.sleep(1.5 * attempt)
+                continue
+            raise RuntimeError(f"Invalid model output after {retries} attempts: {exc}") from exc
+
+        except Exception as exc:
+            last_error = exc
+            if not _is_retryable(exc) or attempt >= retries:
+                raise
+            delay = min(30.0, 2 ** (attempt - 1))
+            logger.warning(
+                "Transient API error for %s (attempt %d/%d): %s; retrying in %.1fs",
+                image_path.name, attempt, retries, exc, delay,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(f"Extraction failed: {last_error}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deterministic validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_date(value: str | None) -> datetime | None:
+    if not value:
+        return None
+
+    formats = (
+        "%B %d, %Y",
+        "%b %d, %Y",
+        "%m/%d/%Y",
+        "%m/%d/%y",
+        "%Y-%m-%d",
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(value.strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def validate_extraction(data: TicketExtraction) -> list[str]:
+    """
+    Deterministic checks. These do not 'correct' Claude; they flag records
+    that deserve human review.
+    """
+    issues: list[str] = []
+
+    date_value = data.date.value
+    parsed_date = _parse_date(date_value)
+
+    if date_value and parsed_date is None:
+        issues.append(f"Date could not be parsed: {date_value!r}")
+
+    if parsed_date and data.day_of_week_printed.value:
+        calculated = parsed_date.strftime("%A")
+        printed = data.day_of_week_printed.value.strip()
+        if calculated.lower() != printed.lower():
+            issues.append(
+                f"Day mismatch: ticket says {printed!r}, date calculates to {calculated!r}"
+            )
+
+    if (
+        data.home_team.value
+        and data.away_team.value
+        and data.home_team.value.strip().lower() == data.away_team.value.strip().lower()
+    ):
+        issues.append("Home team and away team are identical")
+
+    if data.price.value and not re.search(r"\d", data.price.value):
+        issues.append(f"Price contains no digits: {data.price.value!r}")
+
+    for field_name in (
+        "game_number", "section", "row", "seat", "gate"
+    ):
+        field = getattr(data, field_name)
+        if field.value is not None and not field.value.strip():
+            issues.append(f"{field_name} is blank instead of null")
+
+    if data.confidence == "high":
+        low_or_medium = []
+        for field_name in (
+            "date", "game_time", "home_team", "away_team",
+            "stadium", "section", "row", "seat"
+        ):
+            field = getattr(data, field_name)
+            if field.value is not None and field.confidence != "high":
+                low_or_medium.append(field_name)
+        if low_or_medium:
+            issues.append(
+                "Overall confidence is high but these populated important fields "
+                f"are not high confidence: {', '.join(low_or_medium)}"
+            )
+
+    return issues
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Excel output
+# ─────────────────────────────────────────────────────────────────────────────
 
 HEADERS = [
-    "File Name", "Date", "Day", "Time", "Home Team", "Away Team",
-    "Stadium", "Game #", "Section", "Row", "Seat", "Seat Type",
-    "Gate", "Price", "Season Ticket", "Notes", "Confidence",
+    "File Name", "Date", "Day Printed", "Day Calculated", "Time",
+    "Home Team", "Away Team", "Stadium", "Game #", "Section", "Row", "Seat",
+    "Seat Type", "Gate", "Price", "Season Ticket", "Confidence",
+    "Validation Issues", "Notes", "Raw Text", "Model", "Processed At",
+    "Status", "Error",
 ]
 
-FIELD_TO_HEADER = {
-    "date": "Date", "day_of_week": "Day", "game_time": "Time",
-    "home_team": "Home Team", "away_team": "Away Team", "stadium": "Stadium",
-    "game_number": "Game #", "section": "Section", "row": "Row",
-    "seat": "Seat", "seat_type": "Seat Type", "gate": "Gate",
-    "price": "Price", "season_ticket": "Season Ticket",
-    "notes": "Notes", "confidence": "Confidence",
+COLUMN_WIDTHS = {
+    "File Name": 30, "Date": 18, "Day Printed": 14, "Day Calculated": 14,
+    "Time": 12, "Home Team": 22, "Away Team": 22, "Stadium": 24,
+    "Game #": 9, "Section": 10, "Row": 8, "Seat": 8, "Seat Type": 20,
+    "Gate": 8, "Price": 12, "Season Ticket": 14, "Confidence": 12,
+    "Validation Issues": 45, "Notes": 40, "Raw Text": 55, "Model": 30,
+    "Processed At": 22, "Status": 14, "Error": 45,
 }
 
 CONFIDENCE_COLORS = {
-    "high":   "C6EFCE",  # green
-    "medium": "FFEB9C",  # yellow
-    "low":    "FFC7CE",  # red
+    "high": "C6EFCE",
+    "medium": "FFEB9C",
+    "low": "FFC7CE",
+    "error": "FFC7CE",
+    "review": "FFEB9C",
 }
 
-HEADER_FILL   = PatternFill("solid", start_color="1F4E79")
-HEADER_FONT   = Font(bold=True, color="FFFFFF", name="Arial", size=10)
-DATA_FONT     = Font(name="Arial", size=10)
-CENTER        = Alignment(horizontal="center", vertical="center", wrap_text=True)
-LEFT          = Alignment(horizontal="left",   vertical="center", wrap_text=True)
-THIN          = Side(style="thin", color="CCCCCC")
-BORDER        = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
-
-COL_WIDTHS = {
-    "File Name": 28, "Date": 18, "Day": 10, "Time": 10,
-    "Home Team": 22, "Away Team": 22, "Stadium": 22,
-    "Game #": 8, "Section": 9, "Row": 6, "Seat": 6,
-    "Seat Type": 18, "Gate": 6, "Price": 10,
-    "Season Ticket": 13, "Notes": 35, "Confidence": 12,
-}
+HEADER_FILL = PatternFill("solid", start_color="1F4E79")
+HEADER_FONT = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+DATA_FONT = Font(name="Arial", size=10)
+CENTER = Alignment(horizontal="center", vertical="top", wrap_text=True)
+LEFT = Alignment(horizontal="left", vertical="top", wrap_text=True)
+THIN = Side(style="thin", color="CCCCCC")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
 
-def build_excel(records: list[dict], output_path: Path):
+def _field_value(data: TicketExtraction, name: str) -> str | None:
+    return getattr(data, name).value
+
+
+def build_excel(records: list[dict[str, Any]], output_path: Path, model: str) -> None:
     wb = Workbook()
-
-    # ── Data sheet ──
     ws = wb.active
     ws.title = "Tickets"
     ws.freeze_panes = "B2"
-    ws.row_dimensions[1].height = 30
+    ws.sheet_view.showGridLines = False
+    ws.row_dimensions[1].height = 32
 
-    # Headers
     for col_idx, header in enumerate(HEADERS, 1):
         cell = ws.cell(row=1, column=col_idx, value=header)
-        cell.font   = HEADER_FONT
-        cell.fill   = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
         cell.alignment = CENTER
         cell.border = BORDER
-        ws.column_dimensions[get_column_letter(col_idx)].width = COL_WIDTHS.get(header, 14)
+        ws.column_dimensions[get_column_letter(col_idx)].width = COLUMN_WIDTHS.get(header, 14)
 
-    # Data rows
     for row_idx, rec in enumerate(records, 2):
-        ws.row_dimensions[row_idx].height = 18
-        data = rec.get("data", {})
-        err  = rec.get("error")
-        conf = (data.get("confidence") or "").lower()
-        fill_color = CONFIDENCE_COLORS.get(conf, "FFFFFF")
-        row_fill   = PatternFill("solid", start_color=fill_color)
+        data: TicketExtraction | None = rec.get("data")
+        issues = rec.get("validation_issues", [])
+        error = rec.get("error")
+        processed_at = rec.get("processed_at")
 
-        row_values = [
-            rec["filename"],
-            data.get("date"),
-            data.get("day_of_week"),
-            data.get("game_time"),
-            data.get("home_team"),
-            data.get("away_team"),
-            data.get("stadium"),
-            data.get("game_number"),
-            data.get("section"),
-            data.get("row"),
-            data.get("seat"),
-            data.get("seat_type"),
-            data.get("gate"),
-            data.get("price"),
-            data.get("season_ticket"),
-            err if err else data.get("notes"),
-            data.get("confidence") if not err else "ERROR",
-        ]
+        if data:
+            parsed_date = _parse_date(data.date.value)
+            calculated_day = parsed_date.strftime("%A") if parsed_date else None
 
-        for col_idx, value in enumerate(row_values, 1):
+            values = [
+                rec["filename"],
+                _field_value(data, "date"),
+                _field_value(data, "day_of_week_printed"),
+                calculated_day,
+                _field_value(data, "game_time"),
+                _field_value(data, "home_team"),
+                _field_value(data, "away_team"),
+                _field_value(data, "stadium"),
+                _field_value(data, "game_number"),
+                _field_value(data, "section"),
+                _field_value(data, "row"),
+                _field_value(data, "seat"),
+                _field_value(data, "seat_type"),
+                _field_value(data, "gate"),
+                _field_value(data, "price"),
+                _field_value(data, "season_ticket"),
+                data.confidence,
+                "\n".join(issues) if issues else None,
+                data.notes,
+                data.raw_text,
+                model,
+                processed_at,
+                "OK" if not issues else "REVIEW",
+                None,
+            ]
+            row_status = "review" if issues else data.confidence
+        else:
+            values = [
+                rec["filename"], *([None] * 20),
+                model, processed_at, "ERROR", error
+            ]
+            row_status = "error"
+
+        ws.row_dimensions[row_idx].height = 60 if data else 35
+
+        for col_idx, value in enumerate(values, 1):
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
-            cell.font      = DATA_FONT
-            cell.border    = BORDER
-            cell.fill      = row_fill
-            cell.alignment = CENTER if col_idx != len(HEADERS) - 1 else LEFT
+            cell.font = DATA_FONT
+            cell.border = BORDER
+            cell.alignment = CENTER if col_idx in {
+                1, 2, 3, 4, 5, 9, 10, 11, 12, 14, 15, 16, 17, 23
+            } else LEFT
 
-    # Auto-filter
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(HEADERS))}1"
+        fill = PatternFill("solid", start_color=CONFIDENCE_COLORS.get(row_status, "FFFFFF"))
+        for col_idx in range(1, len(HEADERS) + 1):
+            ws.cell(row=row_idx, column=col_idx).fill = fill
 
-    # ── Summary sheet ──
+    if records:
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(HEADERS))}{len(records) + 1}"
+
+    ws.conditional_formatting.add(
+        f"Q2:Q{max(2, len(records) + 1)}",
+        FormulaRule(formula=['Q2="high"'], fill=PatternFill("solid", start_color=CONFIDENCE_COLORS["high"]))
+    )
+
+    # Summary sheet
     ws2 = wb.create_sheet("Summary")
-    total     = len(records)
-    succeeded = sum(1 for r in records if not r.get("error"))
-    failed    = total - succeeded
-    low_conf  = sum(1 for r in records
-                    if not r.get("error") and
-                    (r["data"].get("confidence") or "").lower() == "low")
+    ws2.sheet_view.showGridLines = False
+    total = len(records)
+    succeeded = sum(1 for r in records if r.get("data"))
+    failed = total - succeeded
+    review = sum(1 for r in records if r.get("validation_issues"))
+    high = sum(
+        1 for r in records
+        if r.get("data") and r["data"].confidence == "high"
+    )
+    medium = sum(
+        1 for r in records
+        if r.get("data") and r["data"].confidence == "medium"
+    )
+    low = sum(
+        1 for r in records
+        if r.get("data") and r["data"].confidence == "low"
+    )
+
+    ws2["A1"] = "Baseball Ticket Extraction V2"
+    ws2["A1"].font = Font(bold=True, size=15, name="Arial", color="1F4E79")
+    ws2.column_dimensions["A"].width = 38
+    ws2.column_dimensions["B"].width = 20
 
     summary_rows = [
         ("Total tickets processed", total),
-        ("Successfully extracted",  succeeded),
-        ("Errors (needs manual review)", failed),
-        ("Low confidence extractions",   low_conf),
+        ("Successfully extracted", succeeded),
+        ("API / processing errors", failed),
+        ("Records requiring review", review),
+        ("High confidence", high),
+        ("Medium confidence", medium),
+        ("Low confidence", low),
+        ("Model", model),
         ("Run date", datetime.now().strftime("%B %d, %Y %I:%M %p")),
     ]
-
-    ws2["A1"] = "Ticket Extraction Summary"
-    ws2["A1"].font = Font(bold=True, size=14, name="Arial", color="1F4E79")
-    ws2.column_dimensions["A"].width = 35
-    ws2.column_dimensions["B"].width = 20
 
     for i, (label, value) in enumerate(summary_rows, 3):
         ws2.cell(row=i, column=1, value=label).font = Font(bold=True, name="Arial")
         ws2.cell(row=i, column=2, value=value).font = Font(name="Arial")
 
-    ws2["A9"] = "Color Legend"
-    ws2["A9"].font = Font(bold=True, name="Arial")
-    for i, (conf, color, label) in enumerate([
-        ("high",   "C6EFCE", "High confidence"),
-        ("medium", "FFEB9C", "Medium confidence — review recommended"),
-        ("low",    "FFC7CE", "Low confidence — manual review required"),
-    ], 10):
-        c = ws2.cell(row=i, column=1, value=label)
-        c.fill = PatternFill("solid", start_color=color)
-        c.font = Font(name="Arial")
+    ws2["A14"] = "Review guidance"
+    ws2["A14"].font = Font(bold=True, name="Arial", color="1F4E79")
+    ws2["A15"] = (
+        "Review rows marked REVIEW or ERROR. Validation flags are deterministic "
+        "checks and do not automatically mean the extraction is wrong."
+    )
+    ws2["A15"].alignment = LEFT
+    ws2.merge_cells("A15:B17")
 
     wb.save(output_path)
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI / batch processing
+# ─────────────────────────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(description="Extract baseball ticket data to Excel")
-    parser.add_argument("--tickets", required=True,
-                        help="Path to folder containing ticket images")
-    parser.add_argument("--output", default="baseball_tickets.xlsx",
-                        help="Output Excel file path (default: baseball_tickets.xlsx)")
-    parser.add_argument("--model", choices=["haiku", "sonnet"], default="haiku",
-                        help="Claude model to use (default: haiku — fastest/cheapest)")
-    parser.add_argument("--api-key", default=None,
-                        help="Anthropic API key (or set ANTHROPIC_API_KEY env var)")
+def process_one(
+    client: anthropic.Anthropic,
+    image_path: Path,
+    model: str,
+    retries: int,
+    timeout: float,
+) -> dict[str, Any]:
+    processed_at = datetime.now().isoformat(timespec="seconds")
+
+    try:
+        data = extract_ticket(
+            client=client,
+            image_path=image_path,
+            model=model,
+            retries=retries,
+            timeout=timeout,
+        )
+        issues = validate_extraction(data)
+        return {
+            "filename": image_path.name,
+            "data": data,
+            "validation_issues": issues,
+            "processed_at": processed_at,
+        }
+    except Exception as exc:
+        return {
+            "filename": image_path.name,
+            "data": None,
+            "validation_issues": [],
+            "processed_at": processed_at,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Extract baseball ticket data to a review-friendly Excel workbook"
+    )
+    parser.add_argument("--tickets", required=True, help="Folder containing ticket images")
+    parser.add_argument(
+        "--output", default="baseball_tickets_v2.xlsx",
+        help="Output Excel path"
+    )
+    parser.add_argument(
+        "--model", choices=sorted(MODELS), default="haiku",
+        help="Claude model alias (default: haiku)"
+    )
+    parser.add_argument(
+        "--api-key", default=None,
+        help="Anthropic API key (or use ANTHROPIC_API_KEY)"
+    )
+    parser.add_argument(
+        "--workers", type=int, default=DEFAULT_WORKERS,
+        help=f"Maximum concurrent API requests (default: {DEFAULT_WORKERS})"
+    )
+    parser.add_argument(
+        "--retries", type=int, default=DEFAULT_RETRIES,
+        help=f"Retries for transient/invalid responses (default: {DEFAULT_RETRIES})"
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=DEFAULT_TIMEOUT,
+        help=f"Per-request timeout in seconds (default: {DEFAULT_TIMEOUT})"
+    )
+    parser.add_argument(
+        "--max-image-dimension", type=int, default=DEFAULT_MAX_IMAGE_DIMENSION,
+        help=f"Resize largest image dimension to this many pixels (default: {DEFAULT_MAX_IMAGE_DIMENSION})"
+    )
     args = parser.parse_args()
+
+    if args.workers < 1:
+        parser.error("--workers must be >= 1")
+    if args.retries < 1:
+        parser.error("--retries must be >= 1")
 
     tickets_dir = Path(args.tickets)
     if not tickets_dir.is_dir():
-        print(f"Error: '{tickets_dir}' is not a valid directory.")
-        sys.exit(1)
+        print(f"Error: '{tickets_dir}' is not a valid directory.", file=sys.stderr)
+        return 1
 
-    image_files = sorted([
+    image_files = sorted(
         p for p in tickets_dir.iterdir()
-        if p.suffix.lower() in SUPPORTED_EXTENSIONS
-    ])
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+    )
 
     if not image_files:
-        print(f"No supported image files found in '{tickets_dir}'.")
-        print(f"Supported formats: {', '.join(SUPPORTED_EXTENSIONS)}")
-        sys.exit(1)
+        print(f"No supported image files found in '{tickets_dir}'.", file=sys.stderr)
+        return 1
 
     model_id = MODELS[args.model]
-    client   = anthropic.Anthropic(api_key=args.api_key) if args.api_key else anthropic.Anthropic()
+    client = anthropic.Anthropic(
+        api_key=args.api_key or os.getenv("ANTHROPIC_API_KEY")
+    )
 
-    print(f"\n🎟️  Baseball Ticket Extractor")
-    print(f"   Found {len(image_files)} image(s) in '{tickets_dir}'")
-    print(f"   Model : {args.model} ({model_id})")
-    print(f"   Output: {args.output}\n")
+    print("\n🎟️  Baseball Ticket Extractor V2")
+    print(f"   Found    : {len(image_files)} image(s)")
+    print(f"   Model    : {args.model} ({model_id})")
+    print(f"   Workers  : {args.workers}")
+    print(f"   Output   : {args.output}\n")
 
-    records = []
-    errors  = 0
+    records: list[dict[str, Any]] = [None] * len(image_files)  # type: ignore[list-item]
 
-    for i, img_path in enumerate(image_files, 1):
-        print(f"[{i:>3}/{len(image_files)}] {img_path.name} ... ", end="", flush=True)
-        try:
-            data = extract_ticket(client, img_path, model_id)
-            conf = (data.get("confidence") or "?").upper()
-            print(f"✓  ({conf})")
-            records.append({"filename": img_path.name, "data": data})
-        except json.JSONDecodeError as e:
-            print(f"⚠  JSON parse error: {e}")
-            records.append({"filename": img_path.name, "data": {}, "error": f"JSON parse error: {e}"})
-            errors += 1
-        except Exception as e:
-            print(f"✗  {e}")
-            records.append({"filename": img_path.name, "data": {}, "error": str(e)})
-            errors += 1
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        future_map = {
+            executor.submit(
+                process_one, client, path, model_id, args.retries, args.timeout
+            ): (index, path)
+            for index, path in enumerate(image_files)
+        }
+
+        completed = 0
+        for future in as_completed(future_map):
+            index, path = future_map[future]
+            record = future.result()
+            records[index] = record
+            completed += 1
+
+            if record.get("error"):
+                print(
+                    f"[{completed:>3}/{len(image_files)}] {path.name} ... ✗ "
+                    f"{record['error']}"
+                )
+            else:
+                data: TicketExtraction = record["data"]
+                status = "REVIEW" if record["validation_issues"] else data.confidence.upper()
+                print(f"[{completed:>3}/{len(image_files)}] {path.name} ... ✓ ({status})")
 
     output_path = Path(args.output)
-    build_excel(records, output_path)
+    build_excel(records, output_path, model_id)
 
-    print(f"\n✅ Done! {len(records) - errors}/{len(records)} tickets extracted successfully.")
-    if errors:
-        print(f"⚠️  {errors} ticket(s) had errors — see the 'Notes' column for details.")
-    print(f"📊 Saved to: {output_path.resolve()}\n")
+    succeeded = sum(1 for r in records if r.get("data"))
+    errors = len(records) - succeeded
+    reviews = sum(1 for r in records if r.get("validation_issues"))
+
+    print(f"\n✅ Done! {succeeded}/{len(records)} tickets extracted successfully.")
+    print(f"   Review flags : {reviews}")
+    print(f"   Errors       : {errors}")
+    print(f"   Saved to     : {output_path.resolve()}\n")
+
+    return 0 if errors == 0 else 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
