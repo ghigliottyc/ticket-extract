@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Baseball Ticket Extractor V2
+Baseball Ticket Extractor V3
 
 Extracts structured data from baseball ticket images using Claude's vision API,
 validates the response, performs deterministic cross-field checks, and writes
