@@ -305,23 +305,48 @@ def extract_ticket(
 # Deterministic validation
 # ─────────────────────────────────────────────────────────────────────────────
 
+_LEADING_DOW_RE = re.compile(
+    r"^(mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s+", re.IGNORECASE
+)
+
+
 def _parse_date(value: str | None) -> datetime | None:
     if not value:
         return None
 
+    cleaned = value.strip()
+    cleaned = _LEADING_DOW_RE.sub("", cleaned)  # drop "TUE " / "Tue., " prefix
+    cleaned = cleaned.replace(".", "")          # "JUL." -> "JUL", "SEPT." -> "SEPT"
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
     formats = (
-        "%B %d, %Y",
-        "%b %d, %Y",
-        "%m/%d/%Y",
-        "%m/%d/%y",
+        "%B %d, %Y", "%B %d %Y",
+        "%b %d, %Y", "%b %d %Y",
+        "%m/%d/%Y", "%m/%d/%y",
         "%Y-%m-%d",
     )
     for fmt in formats:
         try:
-            return datetime.strptime(value.strip(), fmt)
+            return datetime.strptime(cleaned, fmt)
         except ValueError:
             continue
+
+    # Last resort: normalize 4-letter month abbreviations (e.g. "Sept") to 3.
+    cleaned2 = re.sub(r"\bsept\b", "sep", cleaned, flags=re.IGNORECASE)
+    if cleaned2 != cleaned:
+        for fmt in ("%b %d, %Y", "%b %d %Y"):
+            try:
+                return datetime.strptime(cleaned2, fmt)
+            except ValueError:
+                continue
+
     return None
+
+
+def _normalize_day(value: str) -> str:
+    """Reduce a weekday string to a bare 3-letter lowercase code so that
+    'Wednesday', 'WED', 'Wed.', and 'wed' all compare equal."""
+    return re.sub(r"[^A-Za-z]", "", value).lower()[:3]
 
 
 def validate_extraction(data: TicketExtraction) -> list[str]:
@@ -340,7 +365,7 @@ def validate_extraction(data: TicketExtraction) -> list[str]:
     if parsed_date and data.day_of_week_printed.value:
         calculated = parsed_date.strftime("%A")
         printed = data.day_of_week_printed.value.strip()
-        if calculated.lower() != printed.lower():
+        if _normalize_day(calculated) != _normalize_day(printed):
             issues.append(
                 f"Day mismatch: ticket says {printed!r}, date calculates to {calculated!r}"
             )
