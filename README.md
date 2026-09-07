@@ -1,6 +1,6 @@
 # Ticket Extractor
 
-Turns a folder of baseball ticket photos into a review-ready Excel workbook. Each image is sent to Claude's vision API, the response is validated against a schema, cross-checked with deterministic rules, and written to a spreadsheet with color-coded status so you know exactly which rows to double-check by hand.
+This script turns a folder of baseball ticket photos into a review-ready Excel workbook. Each image is sent to Claude's vision API, the response is validated against a schema, cross-checked with deterministic rules, and written to a spreadsheet with color-coded status so you know exactly which rows to double-check by hand.
 
 ## Features
 
@@ -71,7 +71,7 @@ The sheet has frozen header/first column, an autofilter, and conditional formatt
 
 ### A note on the REVIEW status
 
-`Validation Issues` are deterministic sanity checks, not proof the extraction is wrong. A flagged row often just means "something here is worth a second look" — e.g. a date format the parser doesn't recognize yet, not necessarily a misread ticket. Treat `REVIEW` as a triage signal.
+`Validation Issues` are deterministic sanity checks. A flagged row often just means "something here is worth a second look" — e.g. a date format the parser doesn't recognize yet, not necessarily a misread ticket.
 
 ## How extraction works
 
